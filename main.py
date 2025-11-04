@@ -141,7 +141,7 @@ async def analyze_with_openai(detected_text: str, labels: list) -> str:
         print(f"OpenAI API Error: {e}")
         return f"LLM Analysis failed due to an API error: {e}"
 
-@app.post("/analyze_image/")
+@app.post("/")
 async def analyze_image_endpoint(image_file: UploadFile = File(...)):
     print(f"INFO: Received file: {image_file.filename}")
     
