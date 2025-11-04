@@ -131,13 +131,20 @@ async def analyze_with_openai(detected_text: str, labels: list) -> str:
             ]
         )
 
-        # Defensive handling for missing or empty responses
-        message_data = getattr(response.choices[0], "message", None)
-        summary_content = getattr(message_data, "content", None)
+        # Extract content safely from multiple possible locations
+        summary_content = None
+
+        if hasattr(response.choices[0], "message") and getattr(response.choices[0].message, "content", None):
+            summary_content = response.choices[0].message.content
+        elif hasattr(response.choices[0], "text"):
+            summary_content = response.choices[0].text
+        else:
+            summary_content = None
 
         if not summary_content or not summary_content.strip():
-            print("WARN: OpenAI returned an empty message.content.")
-            return "LLM Insight: Analysis completed but no summary was generated. Try with a clearer food label."
+            print("⚠️ WARN: OpenAI returned an empty response. Full API object:")
+            print(response)
+            return "LLM could not generate an analysis. Please upload a clearer or more detailed food label."
 
         return summary_content.strip()
 
