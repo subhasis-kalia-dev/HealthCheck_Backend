@@ -3,64 +3,59 @@ import json
 import base64
 from io import BytesIO
 
+from dotenv import load_dotenv
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from google.cloud import vision
 from google.protobuf.json_format import MessageToDict
+from google.oauth2 import service_account
+from openai import OpenAI
 
-# --- CORE VISION AUTHENTICATION FIX ---
-# This function handles authentication for both local (ADC file) and Render (JSON string).
+load_dotenv()
+
+openai_client = None
+try:
+    openai_client = OpenAI()
+except Exception as e:
+    print(f"ERROR: Failed to initialize OpenAI Client: {e}")
+
+vision_client = None
+
 def initialize_vision_client():
-    # 1. Check for the Base64 JSON string (used for Render deployment)
-    json_base64 = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS_JSON")
+    global vision_client
+    
+    json_base64 = os.getenv("GOOGLE_APPLICATION_CREDENTIALS_JSON")
     if json_base64:
         try:
-            # Decode the Base64 string to get the raw service account key JSON
-            key_json = base64.b64decode(json_base64).decode('utf-8')
-            key_info = json.loads(key_json)
+            key_json_bytes = base64.b64decode(json_base64)
+            key_json_str = key_json_bytes.decode('utf-8')
+            key_info = json.loads(key_json_str)
+
+            credentials = service_account.Credentials.from_service_account_info(key_info)
             
-            # Use the credentials directly from the key dictionary
-            credentials = vision.credentials.from_service_account_info(key_info)
-            client = vision.ImageAnnotatorClient(credentials=credentials)
-            print("Google Cloud Vision client initialized using Base64 JSON (Render).")
-            return client
+            vision_client = vision.ImageAnnotatorClient(credentials=credentials)
+            print("INFO: Successfully initialized Vision client from GOOGLE_APPLICATION_CREDENTIALS_JSON.")
+            return
+
         except Exception as e:
             print(f"ERROR: Failed to initialize client from GOOGLE_APPLICATION_CREDENTIALS_JSON: {e}")
-            return None
-    
-    # 2. If Base64 is not found, try default ADC search (used for local deployment)
+
     try:
-        client = vision.ImageAnnotatorClient()
-        print("Google Cloud Vision client initialized using default ADC (Local).")
-        return client
+        vision_client = vision.ImageAnnotatorClient()
+        print("INFO: Successfully initialized Vision client using Application Default Credentials (ADC) or path.")
+        
     except Exception as e:
-        print(f"ERROR: Failed to initialize Google Cloud Vision client using default ADC: {e}")
-        return None
+        print(f"CRITICAL ERROR: Failed to initialize Vision client using any method. Details: {e}")
+        raise RuntimeError("Failed to initialize Google Vision client. Check GOOGLE_APPLICATION_CREDENTIALS.")
 
-# Initialize the Vision API Client once
-# Note: We need to import 'vision.credentials' first, which is why we must place this after imports.
-try:
-    vision_client = initialize_vision_client()
-    if vision_client is None:
-        raise Exception("Failed to initialize Vision client using any method.")
-except Exception as e:
-    vision_client = None
-    print(f"CRITICAL ERROR: {e}")
-# --- END CORE VISION AUTHENTICATION FIX ---
+initialize_vision_client()
 
+app = FastAPI()
 
-app = FastAPI(
-    title="Cloud Vision Image Analysis",
-    description="FastAPI endpoint for uploading an image and analyzing it using the Google Cloud Vision API.",
-    version="1.0.0"
-)
-
-# --- CORS Configuration (Cross-Origin Resource Sharing) ---
 origins = [
     "http://localhost:5173",
-    "http://127.0.0.1:8000",
-    "https://ingredienthealthcheck.netlify.app", 
-    "https://healthcheck-backend-g2hd.onrender.com", 
+    "https://ingredienthealthcheck.netlify.app",
+    "https://healthcheck-backend-g2hd.onrender.com"
 ]
 
 app.add_middleware(
@@ -70,79 +65,100 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-# ------------------------------------------------------------
 
-
-@app.get("/", tags=["Root"])
-def read_root():
-    """Simple health check endpoint."""
-    auth_status = "Authenticated" if vision_client else "Authentication Failed"
-    return {"message": "Cloud Vision API is running.", "auth_status": auth_status}
-
-
-@app.post("/analyze-image", tags=["Vision Analysis"])
-async def analyze_uploaded_image(image_file: UploadFile = File(...)):
-    """
-    Analyzes an uploaded image using the Cloud Vision API to detect labels and safe search attributes.
-    """
+async def vision_process_uploaded_image(image_file: UploadFile):
     if vision_client is None:
-        # Check if the client failed to initialize earlier
-        raise HTTPException(
-            status_code=500,
-            detail="Vision API Client not initialized. Check server logs and GOOGLE_APPLICATION_CREDENTIALS_JSON variable."
-        )
-
-    # 1. Read the image file content
+        raise HTTPException(status_code=500, detail="Vision client not initialized.")
+        
     try:
-        image_content = await image_file.read()
+        image_content = await image_file.read() 
     except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Could not read image file: {e}")
+        raise HTTPException(status_code=400, detail=f"Could not read uploaded image file: {e}")
 
-    # 2. Create the Vision API image object
-    image = vision.Image(content=image_content)
-
-    # 3. Configure and make the API request
     try:
+        image = vision.Image(content=image_content)
+
         features = [
+            vision.Feature(type_=vision.Feature.Type.TEXT_DETECTION),
             vision.Feature(type_=vision.Feature.Type.LABEL_DETECTION),
-            vision.Feature(type_=vision.Feature.Type.SAFE_SEARCH_DETECTION),
         ]
 
         response = vision_client.annotate_image(
-            {
-                "image": image,
-                "features": features
-            }
+            {"image": image, "features": features}
         )
-    except Exception as e:
-        print(f"Vision API Call Error: {e}")
-        raise HTTPException(status_code=500, detail=f"Vision API request failed. Error: {e}")
 
-    # 4. Process the response
-    results = MessageToDict(response._pb)
-
-    # Extract the relevant parts for a clean response
-    processed_response = {
-        "filename": image_file.filename,
-        "content_type": image_file.content_type,
-        "labels": [],
-        "safe_search_attributes": {}
-    }
-    
-    # Extract Labels
-    if 'labelAnnotations' in results:
-        processed_response["labels"] = [
-            {"description": label.get("description"), "score": round(float(label.get("score", 0)), 4)}
-            for label in results['labelAnnotations'][:5]
+        vision_results = MessageToDict(response._pb)
+        
+        detected_text = vision_results.get('textAnnotations', [{}])[0].get('description', 'No text detected.')
+        
+        labels = [
+            f"{label.get('description')} (Score: {round(float(label.get('score', 0)), 2)})"
+            for label in vision_results.get('labelAnnotations', [])[:5]
         ]
+        
+        return {
+            "text": detected_text,
+            "labels": labels
+        }
 
-    # Extract Safe Search Results
-    if 'safeSearchAnnotation' in results:
-        processed_response["safe_search_attributes"] = results['safeSearchAnnotation']
+    except Exception as e:
+        print(f"Cloud Vision API Error: {e}")
+        raise HTTPException(status_code=500, detail=f"Cloud Vision API call failed: {e}. Check image format and API access.")
 
+async def analyze_with_openai(detected_text: str, labels: list) -> str:
+    if not os.getenv('OPENAI_API_KEY'):
+        return "LLM Analysis failed: OPENAI_API_KEY is not configured on the server."
+        
+    prompt = f"""
+    You are an expert food and health analyst. Your task is to analyze a food label.
+    
+    --- RAW TEXT (OCR) ---
+    {detected_text}
+    
+    --- DETECTED OBJECTS ---
+    {', '.join(labels)}
+    
+    --- ANALYSIS INSTRUCTIONS ---
+    1. Identify the main ingredients from the RAW TEXT.
+    2. Provide a brief health summary (1-2 sentences) focusing on potential allergens, high sugar/salt content, or harmful additives.
+    3. Conclude with a clear recommendation (e.g., "Good choice," "Consume in moderation," or "Avoid").
+    
+    Provide the analysis in a clear, readable format. Do not include introductory text or the prompt itself.
+    """
 
-    # 5. Return the structured results
+    try:
+        response = openai_client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[
+                {"role": "system", "content": "You are an expert food and health analyst providing concise, actionable summaries."},
+                {"role": "user", "content": prompt}
+            ],
+            temperature=0.4,
+            max_tokens=400
+        )
+        return response.choices[0].message.content
+    except Exception as e:
+        print(f"OpenAI API Error: {e}")
+        return f"LLM Analysis failed due to an API error: {e}"
+
+@app.post("/analyze_image/")
+async def analyze_image_endpoint(image_file: UploadFile = File(...)):
+    print(f"INFO: Received file: {image_file.filename}")
+    
+    vision_results = await vision_process_uploaded_image(image_file)
+    detected_text = vision_results["text"]
+    labels = vision_results["labels"]
+    
+    print(f"INFO: Vision detected {len(detected_text)} characters and {len(labels)} labels.")
+    
+    openai_summary = await analyze_with_openai(detected_text, labels)
+    
     return {
-        "status": "success",
-        "analysis_results": processed_response
+        "summary": openai_summary,
+        "raw_text_detected": detected_text,
+        "detected_labels": labels
     }
+
+@app.get("/")
+def read_root():
+    return {"message": "Image Analysis API is running. Use the /analyze_image/ endpoint for POST requests."}
