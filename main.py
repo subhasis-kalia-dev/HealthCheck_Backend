@@ -33,7 +33,7 @@ app = FastAPI(
 )
 
 # Allow CORS for local development with your React frontend
-rigins = [
+origins = [
     "http://localhost:5173",  # Your React development server
     "http://127.0.0.1:8000",  # Local testing
     
