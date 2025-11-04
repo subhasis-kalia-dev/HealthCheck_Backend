@@ -13,12 +13,14 @@ from openai import OpenAI
 
 load_dotenv()
 
+# Initialize OpenAI client
 openai_client = None
 try:
     openai_client = OpenAI()
 except Exception as e:
     print(f"ERROR: Failed to initialize OpenAI Client: {e}")
 
+# Initialize Vision client
 vision_client = None
 
 def initialize_vision_client():
@@ -28,28 +30,26 @@ def initialize_vision_client():
     if json_base64:
         try:
             key_json_bytes = base64.b64decode(json_base64)
-            key_json_str = key_json_bytes.decode('utf-8')
+            key_json_str = key_json_bytes.decode("utf-8")
             key_info = json.loads(key_json_str)
 
             credentials = service_account.Credentials.from_service_account_info(key_info)
-            
             vision_client = vision.ImageAnnotatorClient(credentials=credentials)
             print("INFO: Successfully initialized Vision client from GOOGLE_APPLICATION_CREDENTIALS_JSON.")
             return
-
         except Exception as e:
             print(f"ERROR: Failed to initialize client from GOOGLE_APPLICATION_CREDENTIALS_JSON: {e}")
 
     try:
         vision_client = vision.ImageAnnotatorClient()
         print("INFO: Successfully initialized Vision client using Application Default Credentials (ADC) or path.")
-        
     except Exception as e:
-        print(f"CRITICAL ERROR: Failed to initialize Vision client using any method. Details: {e}")
+        print(f"CRITICAL ERROR: Failed to initialize Vision client: {e}")
         raise RuntimeError("Failed to initialize Google Vision client. Check GOOGLE_APPLICATION_CREDENTIALS.")
 
 initialize_vision_client()
 
+# FastAPI setup
 app = FastAPI()
 
 origins = [
@@ -66,14 +66,16 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+
+# ---------- Vision Processing ----------
 async def vision_process_uploaded_image(image_file: UploadFile):
     if vision_client is None:
         raise HTTPException(status_code=500, detail="Vision client not initialized.")
         
     try:
-        image_content = await image_file.read() 
+        image_content = await image_file.read()
     except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Could not read uploaded image file: {e}")
+        raise HTTPException(status_code=400, detail=f"Could not read uploaded image: {e}")
 
     try:
         image = vision.Image(content=image_content)
@@ -83,47 +85,41 @@ async def vision_process_uploaded_image(image_file: UploadFile):
             vision.Feature(type_=vision.Feature.Type.LABEL_DETECTION),
         ]
 
-        response = vision_client.annotate_image(
-            {"image": image, "features": features}
-        )
-
+        response = vision_client.annotate_image({"image": image, "features": features})
         vision_results = MessageToDict(response._pb)
-        
-        detected_text = vision_results.get('textAnnotations', [{}])[0].get('description', 'No text detected.')
-        
+
+        detected_text = vision_results.get("textAnnotations", [{}])[0].get("description", "").strip() or "No text detected."
         labels = [
             f"{label.get('description')} (Score: {round(float(label.get('score', 0)), 2)})"
-            for label in vision_results.get('labelAnnotations', [])[:5]
+            for label in vision_results.get("labelAnnotations", [])[:5]
         ]
-        
-        return {
-            "text": detected_text,
-            "labels": labels
-        }
+
+        return {"text": detected_text, "labels": labels}
 
     except Exception as e:
         print(f"Cloud Vision API Error: {e}")
-        raise HTTPException(status_code=500, detail=f"Cloud Vision API call failed: {e}. Check image format and API access.")
+        raise HTTPException(status_code=500, detail=f"Cloud Vision API call failed: {e}")
 
+
+# ---------- OpenAI Analysis ----------
 async def analyze_with_openai(detected_text: str, labels: list) -> str:
-    if not os.getenv('OPENAI_API_KEY'):
-        return "LLM Analysis failed: OPENAI_API_KEY is not configured on the server."
-        
+    if not os.getenv("OPENAI_API_KEY"):
+        return "LLM Analysis failed: OPENAI_API_KEY not configured on the server."
+
     prompt = f"""
     You are an expert food and health analyst. Your task is to analyze a food label.
-    
+
     --- RAW TEXT (OCR) ---
     {detected_text}
-    
+
     --- DETECTED OBJECTS ---
     {', '.join(labels)}
-    
+
     --- ANALYSIS INSTRUCTIONS ---
-    1. Identify the main ingredients from the RAW TEXT.
-    2. Provide a brief health summary (1-2 sentences) focusing on potential allergens, high sugar/salt content, or harmful additives.
-    3. Conclude with a clear recommendation (e.g., "Good choice," "Consume in moderation," or "Avoid").
-    
-    Provide the analysis in a clear, readable format. Do not include introductory text or the prompt itself.
+    1. Identify the main ingredients.
+    2. Provide a short health summary (focus on allergens, sugar/salt, or harmful additives).
+    3. Clearly mention whether the product is SAFE or NON-SAFE for consumption.
+    4. Keep the entire analysis under 200 words.
     """
 
     try:
@@ -131,37 +127,40 @@ async def analyze_with_openai(detected_text: str, labels: list) -> str:
             model="gpt-4o-mini",
             messages=[
                 {"role": "system", "content": "You are an expert food and health analyst providing concise, actionable summaries."},
-                {"role": "user", "content": prompt}
-            ],
-            temperature=0.4,
-            max_tokens=400
+                {"role": "user", "content": prompt.strip()},
+            ]
         )
-        # Check if the response content is null or empty, and handle it gracefully
-        summary_content = response.choices[0].message.content
-        if not summary_content:
-             return "LLM returned a successful response object, but the content field was empty. This usually means the input text was too poor or incomplete."
-        
-        return summary_content
+
+        # Defensive handling for missing or empty responses
+        message_data = getattr(response.choices[0], "message", None)
+        summary_content = getattr(message_data, "content", None)
+
+        if not summary_content or not summary_content.strip():
+            print("WARN: OpenAI returned an empty message.content.")
+            return "LLM Insight: Analysis completed but no summary was generated. Try with a clearer food label."
+
+        return summary_content.strip()
+
     except Exception as e:
         print(f"OpenAI API Error: {e}")
-        return f"LLM Analysis failed due to an API error: {e}"
+        return f"LLM Analysis failed due to API error: {e}"
 
-@app.post("/") 
+
+# ---------- Main Endpoint ----------
+@app.post("/")
 async def analyze_image_endpoint(image_file: UploadFile = File(...)):
     print(f"INFO: Received file: {image_file.filename}")
     
     vision_results = await vision_process_uploaded_image(image_file)
     detected_text = vision_results["text"]
     labels = vision_results["labels"]
-    
+
     print(f"INFO: Vision detected {len(detected_text)} characters and {len(labels)} labels.")
     
     openai_summary = await analyze_with_openai(detected_text, labels)
-    
+
     return {
         "summary": openai_summary,
         "raw_text_detected": detected_text,
         "detected_labels": labels
     }
-
-# Removed @app.get("/") to prevent conflicts.
