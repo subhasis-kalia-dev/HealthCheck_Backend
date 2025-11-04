@@ -13,14 +13,15 @@ from openai import OpenAI
 
 load_dotenv()
 
-# Initialize OpenAI client
+# ---------- Initialize OpenAI client ----------
 openai_client = None
 try:
     openai_client = OpenAI()
+    print("INFO: OpenAI client initialized successfully.")
 except Exception as e:
     print(f"ERROR: Failed to initialize OpenAI Client: {e}")
 
-# Initialize Vision client
+# ---------- Initialize Google Vision client ----------
 vision_client = None
 
 def initialize_vision_client():
@@ -32,24 +33,23 @@ def initialize_vision_client():
             key_json_bytes = base64.b64decode(json_base64)
             key_json_str = key_json_bytes.decode("utf-8")
             key_info = json.loads(key_json_str)
-
             credentials = service_account.Credentials.from_service_account_info(key_info)
             vision_client = vision.ImageAnnotatorClient(credentials=credentials)
-            print("INFO: Successfully initialized Vision client from GOOGLE_APPLICATION_CREDENTIALS_JSON.")
+            print("INFO: Vision client initialized from GOOGLE_APPLICATION_CREDENTIALS_JSON.")
             return
         except Exception as e:
-            print(f"ERROR: Failed to initialize client from GOOGLE_APPLICATION_CREDENTIALS_JSON: {e}")
+            print(f"ERROR: Could not initialize from GOOGLE_APPLICATION_CREDENTIALS_JSON: {e}")
 
     try:
         vision_client = vision.ImageAnnotatorClient()
-        print("INFO: Successfully initialized Vision client using Application Default Credentials (ADC) or path.")
+        print("INFO: Vision client initialized using ADC or path.")
     except Exception as e:
         print(f"CRITICAL ERROR: Failed to initialize Vision client: {e}")
-        raise RuntimeError("Failed to initialize Google Vision client. Check GOOGLE_APPLICATION_CREDENTIALS.")
+        raise RuntimeError("Failed to initialize Google Vision client.")
 
 initialize_vision_client()
 
-# FastAPI setup
+# ---------- FastAPI setup ----------
 app = FastAPI()
 
 origins = [
@@ -67,7 +67,7 @@ app.add_middleware(
 )
 
 
-# ---------- Vision Processing ----------
+# ---------- Google Vision image processing ----------
 async def vision_process_uploaded_image(image_file: UploadFile):
     if vision_client is None:
         raise HTTPException(status_code=500, detail="Vision client not initialized.")
@@ -101,7 +101,7 @@ async def vision_process_uploaded_image(image_file: UploadFile):
         raise HTTPException(status_code=500, detail=f"Cloud Vision API call failed: {e}")
 
 
-# ---------- OpenAI Analysis ----------
+# ---------- OpenAI analysis ----------
 async def analyze_with_openai(detected_text: str, labels: list) -> str:
     if not os.getenv("OPENAI_API_KEY"):
         return "LLM Analysis failed: OPENAI_API_KEY not configured on the server."
@@ -123,28 +123,41 @@ async def analyze_with_openai(detected_text: str, labels: list) -> str:
     """
 
     try:
+        # Modern OpenAI SDK call
         response = openai_client.chat.completions.create(
             model="gpt-4o-mini",
             messages=[
-                {"role": "system", "content": "You are an expert food and health analyst providing concise, actionable summaries."},
+                {
+                    "role": "system",
+                    "content": "You are an expert food and health analyst providing concise, actionable summaries."
+                },
                 {"role": "user", "content": prompt.strip()},
             ]
         )
 
-        # Extract content safely from multiple possible locations
+        # Try extracting content from multiple possible formats
         summary_content = None
 
+        # Old format
         if hasattr(response.choices[0], "message") and getattr(response.choices[0].message, "content", None):
             summary_content = response.choices[0].message.content
+        # New SDK format fallback
+        elif hasattr(response, "output"):
+            try:
+                summary_content = response.output[0].content[0].text
+            except Exception:
+                summary_content = None
+        # Legacy text format fallback
         elif hasattr(response.choices[0], "text"):
             summary_content = response.choices[0].text
-        else:
-            summary_content = None
 
         if not summary_content or not summary_content.strip():
-            print("⚠️ WARN: OpenAI returned an empty response. Full API object:")
+            print("⚠️ WARN: OpenAI returned empty content. Full response:")
             print(response)
             return "LLM could not generate an analysis. Please upload a clearer or more detailed food label."
+
+        # Log to console for backend debugging
+        print(f"✅ LLM Output (first 80 chars): {summary_content[:80]}...")
 
         return summary_content.strip()
 
