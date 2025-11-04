@@ -136,12 +136,17 @@ async def analyze_with_openai(detected_text: str, labels: list) -> str:
             temperature=0.4,
             max_tokens=400
         )
-        return response.choices[0].message.content
+        # Check if the response content is null or empty, and handle it gracefully
+        summary_content = response.choices[0].message.content
+        if not summary_content:
+             return "LLM returned a successful response object, but the content field was empty. This usually means the input text was too poor or incomplete."
+        
+        return summary_content
     except Exception as e:
         print(f"OpenAI API Error: {e}")
         return f"LLM Analysis failed due to an API error: {e}"
 
-@app.post("/")
+@app.post("/") 
 async def analyze_image_endpoint(image_file: UploadFile = File(...)):
     print(f"INFO: Received file: {image_file.filename}")
     
@@ -159,6 +164,4 @@ async def analyze_image_endpoint(image_file: UploadFile = File(...)):
         "detected_labels": labels
     }
 
-@app.get("/")
-def read_root():
-    return {"message": "Image Analysis API is running. Use the /analyze_image/ endpoint for POST requests."}
+# Removed @app.get("/") to prevent conflicts.
