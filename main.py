@@ -33,18 +33,23 @@ app = FastAPI(
 )
 
 # Allow CORS for local development with your React frontend
-origins = [
+rigins = [
     "http://localhost:5173",  # Your React development server
-    "http://127.0.0.1:8000",
-    "*"  # Allows access from any origin (use a specific domain in production)
+    "http://127.0.0.1:8000",  # Local testing
+    
+    # --- Production URLs ---
+    # The LIVE Netlify Frontend URL:
+    "https://ingredienthealthcheck.netlify.app", 
+    # The LIVE Render Backend URL (allows API to talk to itself, good practice):
+    "https://healthcheck-backend-g2hd.onrender.com", 
 ]
 
 app.add_middleware(
     CORSMiddleware,
     allow_origins=origins,
     allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_methods=["*"],  # Allow all HTTP methods (GET, POST, etc.)
+    allow_headers=["*"],  # Allow all request headers
 )
 
 # --- LLM Prompts ---
